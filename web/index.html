@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ConductorOne Report Builder</title>
+<link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+<div class="header">
+  <h1>ConductorOne Report Builder</h1>
+  <div id="tenant-info" class="tenant-info"></div>
+</div>
+
+<div id="app">
+
+  <!-- Connect -->
+  <div class="page" id="page-connect">
+    <div class="container narrow">
+      <div class="card">
+        <h2>Connect to ConductorOne</h2>
+        <div class="field">
+          <label>Client ID</label>
+          <input type="text" id="clientId" placeholder="name@tenant.conductor.one/spc" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>Client Secret</label>
+          <input type="password" id="clientSecret" placeholder="secret-token:..." autocomplete="off">
+        </div>
+        <button class="btn btn-primary btn-full" onclick="App.connect()">Connect</button>
+        <div class="status" id="connect-status"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Dashboard -->
+  <div class="page hidden" id="page-dashboard">
+    <div class="container">
+      <div class="section-header">
+        <h2>Reports</h2>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-ghost" onclick="App.importTemplate()">Import</button>
+          <button class="btn btn-primary" onclick="App.newReport()">+ New Report</button>
+        </div>
+      </div>
+
+      <div class="dashboard-search">
+        <input type="text" placeholder="Search reports..." oninput="Templates.setSearch(this.value)">
+      </div>
+
+      <div id="builtin-templates"></div>
+
+      <h3 class="section-label">My Reports</h3>
+      <div id="user-templates"></div>
+      <div class="empty-state hidden" id="no-user-templates">No saved reports yet. Create one or clone a built-in report.</div>
+
+      <div class="history-section">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <h3 class="section-label" style="margin:0">Recent Reports</h3>
+          <button class="btn btn-ghost btn-sm" onclick="App.cleanupOutput()">Clear Old Files</button>
+        </div>
+        <div id="history-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Report Builder -->
+  <div class="page hidden" id="page-builder">
+    <div class="container">
+      <div class="section-header">
+        <h2 id="builder-title">New Report</h2>
+        <button class="btn btn-ghost" onclick="App.showDashboard()">Back to Dashboard</button>
+      </div>
+
+      <div class="builder-layout">
+        <!-- Sidebar -->
+        <div class="builder-sidebar">
+          <div class="card">
+            <div class="sidebar-section">
+              <h3>Data Source</h3>
+              <div class="field" style="margin:0">
+                <select id="ds-select" onchange="Builder.onDataSourceChange()">
+                  <option value="">-- Select --</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="sidebar-section hidden" id="app-select-group">
+              <h3>Application</h3>
+              <div class="field" style="margin:0">
+                <select id="app-select"></select>
+              </div>
+            </div>
+
+            <div class="sidebar-section" id="columns-section">
+              <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+                <h3 style="margin:0">Columns</h3>
+                <div style="display:flex; gap:4px;">
+                  <button class="btn-link" onclick="Builder.selectAllColumns(true)">All</button>
+                  <span style="color:var(--text-muted);">/</span>
+                  <button class="btn-link" onclick="Builder.selectAllColumns(false)">None</button>
+                </div>
+              </div>
+              <input type="text" class="column-search" placeholder="Search columns..." oninput="Builder.onColumnSearch(this.value)">
+              <div id="column-picker" class="column-picker"></div>
+            </div>
+
+            <div class="sidebar-section" id="filters-section">
+              <h3>Filters</h3>
+              <div id="filter-list"></div>
+              <button class="btn btn-ghost btn-sm" onclick="Builder.addFilter()" style="margin-top:6px; width:100%;">+ Add Filter</button>
+            </div>
+
+            <div class="sidebar-section">
+              <h3>Sort</h3>
+              <div class="sort-row">
+                <select id="sort-by"><option value="">None</option></select>
+                <select id="sort-dir">
+                  <option value="asc">A to Z</option>
+                  <option value="desc">Z to A</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Main -->
+        <div class="builder-main">
+          <div class="builder-toolbar">
+            <div class="toolbar-left">
+              <button class="btn btn-secondary" onclick="App.preview()">Preview Data</button>
+            </div>
+            <div class="toolbar-right">
+              <select id="format-select">
+                <option value="csv">CSV</option>
+                <option value="json">JSON</option>
+                <option value="excel">Excel</option>
+                <option value="html">HTML</option>
+              </select>
+              <button class="btn btn-primary" onclick="App.generate()">Generate Report</button>
+            </div>
+          </div>
+
+          <div class="status" id="builder-status"></div>
+
+          <div id="builder-empty" class="builder-empty-state">
+            <div class="empty-icon">&#x1F4CA;</div>
+            <div class="empty-title">Select a data source to get started</div>
+            <div class="empty-desc">Choose a data source from the sidebar, then pick your columns, add filters, and preview the data before generating your report.</div>
+          </div>
+
+          <div id="builder-content" class="hidden">
+            <div id="preview-area" class="hidden">
+              <div class="card" style="padding: 1em;">
+                <div class="preview-info" id="preview-info"></div>
+                <div class="table-wrap">
+                  <table id="preview-table">
+                    <thead id="preview-thead"></thead>
+                    <tbody id="preview-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div id="download-area" class="hidden">
+              <div class="download-box" id="download-box"></div>
+            </div>
+
+            <div id="viewer-area" class="hidden">
+              <div class="card" style="padding: 1em;">
+                <div class="viewer-toolbar">
+                  <div class="viewer-toolbar-left">
+                    <span class="viewer-info" id="viewer-info"></span>
+                  </div>
+                  <div class="viewer-toolbar-right">
+                    <input type="text" id="viewer-search" class="viewer-search" placeholder="Search rows..." oninput="Builder.onViewerSearch(this.value)">
+                    <button class="btn btn-ghost btn-sm" onclick="Builder.hideViewer(); document.getElementById('download-area').classList.remove('hidden');">Back to Download</button>
+                  </div>
+                </div>
+                <div class="table-wrap" style="max-height: 60vh; overflow-y: auto;">
+                  <table id="viewer-table">
+                    <thead id="viewer-thead"></thead>
+                    <tbody id="viewer-tbody"></tbody>
+                  </table>
+                </div>
+                <div class="viewer-pagination" id="viewer-pagination"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="save-section">
+            <div class="field" style="flex:2">
+              <label>Report Name</label>
+              <input type="text" id="report-name" placeholder="My Custom Report">
+            </div>
+            <div class="field" style="flex:3">
+              <label>Description</label>
+              <input type="text" id="report-desc" placeholder="What this report shows (optional)">
+            </div>
+            <button class="btn btn-primary" onclick="App.saveTemplate()" style="margin-bottom:0; white-space:nowrap;">Save Template</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script src="js/api.js"></script>
+<script src="js/builder.js"></script>
+<script src="js/templates.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
