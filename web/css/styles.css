@@ -348,6 +348,13 @@ h3.section-label { font-size: 0.75em; text-transform: uppercase; letter-spacing:
   margin-top: 2px;
 }
 
+/* Saved credentials box */
+.saved-creds-box {
+  background: var(--primary-bg); border: 1px solid #bfdbfe; border-radius: var(--radius);
+  padding: 1.2em; text-align: center;
+}
+.saved-creds-label { font-size: 0.9em; color: var(--primary); font-weight: 600; margin-bottom: 0.8em; }
+
 /* Connect page centering */
 #page-connect { display: flex; align-items: center; justify-content: center; }
 #page-connect .card { animation: fadeIn 0.3s ease; }

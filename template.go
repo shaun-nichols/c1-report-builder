@@ -81,6 +81,18 @@ func (ts *TemplateStore) Save(t ReportTemplate) error {
 
 	if t.ID == "" {
 		t.ID = generateID(t.Name)
+		// Avoid collisions: if ID exists, append a suffix
+		baseID := t.ID
+		suffix := 1
+		for {
+			if _, exists := ts.user[t.ID]; !exists {
+				if _, builtin := ts.builtin[t.ID]; !builtin {
+					break
+				}
+			}
+			t.ID = fmt.Sprintf("%s-%d", baseID, suffix)
+			suffix++
+		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	if t.CreatedAt == "" {
@@ -89,7 +101,7 @@ func (ts *TemplateStore) Save(t ReportTemplate) error {
 	t.UpdatedAt = now
 	t.Builtin = false
 
-	if err := os.MkdirAll(ts.dir, 0o755); err != nil {
+	if err := os.MkdirAll(ts.dir, 0o700); err != nil {
 		return err
 	}
 
@@ -99,7 +111,7 @@ func (ts *TemplateStore) Save(t ReportTemplate) error {
 	}
 
 	path := filepath.Join(ts.dir, t.ID+".json")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return err
 	}
 

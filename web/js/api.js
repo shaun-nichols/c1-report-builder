@@ -1,6 +1,21 @@
 const API = {
-  async connect(clientId, clientSecret) {
-    return this._post('/api/connect', { clientId, clientSecret });
+  sessionToken: null,
+
+  async connect(clientId, clientSecret, saveToKeyring) {
+    const data = await this._post('/api/connect', { clientId, clientSecret, saveToKeyring: !!saveToKeyring });
+    this.sessionToken = data.sessionToken || null;
+    return data;
+  },
+  async connectFromKeyring() {
+    const data = await this._post('/api/connect', { useKeyring: true });
+    this.sessionToken = data.sessionToken || null;
+    return data;
+  },
+  async getCredentialStatus() {
+    return this._get('/api/credentials');
+  },
+  async clearCredentials() {
+    return this._fetch('/api/credentials', { method: 'DELETE' });
   },
   async getVersion() {
     return this._get('/api/version');
@@ -47,14 +62,23 @@ const API = {
     return this._post('/api/cleanup', {});
   },
   downloadUrl(filename) {
-    return '/api/download/' + encodeURIComponent(filename);
+    // Include session token as query param for download links
+    let url = '/api/download/' + encodeURIComponent(filename);
+    if (this.sessionToken) url += '?token=' + encodeURIComponent(this.sessionToken);
+    return url;
   },
   exportTemplateUrl(id) {
     return '/api/templates/' + encodeURIComponent(id);
   },
+  _headers() {
+    const h = { 'Content-Type': 'application/json' };
+    if (this.sessionToken) h['X-Session-Token'] = this.sessionToken;
+    return h;
+  },
   async _get(url) {
-    const resp = await fetch(url);
-    if (resp.status === 401) { App.onSessionExpired(); throw new Error('Session expired'); }
+    const opts = { headers: this._headers() };
+    const resp = await fetch(url, opts);
+    if (resp.status === 401) { this.sessionToken = null; App.onSessionExpired(); throw new Error('Session expired'); }
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Request failed');
     return data;
@@ -63,9 +87,9 @@ const API = {
     return this._fetch(url, { method: 'POST', body: JSON.stringify(body) });
   },
   async _fetch(url, opts) {
-    opts.headers = { 'Content-Type': 'application/json' };
+    opts.headers = this._headers();
     const resp = await fetch(url, opts);
-    if (resp.status === 401) { App.onSessionExpired(); throw new Error('Session expired'); }
+    if (resp.status === 401) { this.sessionToken = null; App.onSessionExpired(); throw new Error('Session expired'); }
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Request failed');
     return data;

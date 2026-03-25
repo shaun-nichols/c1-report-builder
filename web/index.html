@@ -20,15 +20,38 @@
     <div class="container narrow">
       <div class="card">
         <h2>Connect to ConductorOne</h2>
-        <div class="field">
-          <label>Client ID</label>
-          <input type="text" id="clientId" placeholder="name@tenant.conductor.one/spc" autocomplete="off">
+
+        <!-- Saved credentials option (shown if keyring has creds) -->
+        <div id="keyring-connect" class="hidden" style="margin-bottom: 1.2em;">
+          <div class="saved-creds-box">
+            <div class="saved-creds-label">Saved credentials found in <span id="keyring-name"></span></div>
+            <button class="btn btn-primary btn-full" onclick="App.connectFromKeyring()">Connect with Saved Credentials</button>
+            <div style="display:flex; gap:8px; margin-top:8px; justify-content:center;">
+              <button class="btn btn-ghost btn-sm" onclick="App.clearSavedCredentials()">Remove Saved</button>
+              <button class="btn btn-ghost btn-sm" onclick="document.getElementById('manual-connect').classList.remove('hidden'); document.getElementById('keyring-connect').classList.add('hidden');">Enter Manually</button>
+            </div>
+          </div>
         </div>
-        <div class="field">
-          <label>Client Secret</label>
-          <input type="password" id="clientSecret" placeholder="secret-token:..." autocomplete="off">
+
+        <!-- Manual entry -->
+        <div id="manual-connect">
+          <div class="field">
+            <label>Client ID</label>
+            <input type="text" id="clientId" placeholder="name@tenant.conductor.one/spc" autocomplete="off">
+          </div>
+          <div class="field">
+            <label>Client Secret</label>
+            <input type="password" id="clientSecret" placeholder="secret-token:..." autocomplete="off">
+          </div>
+          <div id="keyring-option" class="hidden" style="margin-bottom: 0.8em;">
+            <label style="display:flex; align-items:center; gap:6px; font-size:0.85em; color:var(--text-light); cursor:pointer;">
+              <input type="checkbox" id="save-to-keyring">
+              Save credentials to <span id="keyring-name-option"></span>
+            </label>
+          </div>
+          <button class="btn btn-primary btn-full" onclick="App.connect()">Connect</button>
         </div>
-        <button class="btn btn-primary btn-full" onclick="App.connect()">Connect</button>
+
         <div class="status" id="connect-status"></div>
       </div>
     </div>

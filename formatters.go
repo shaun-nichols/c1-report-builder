@@ -22,7 +22,7 @@ func hashFile(path string) (string, error) {
 	base := filepath.Base(path)
 	hashPath := path + ".sha256"
 	content := fmt.Sprintf("%s  %s\n", digest, base)
-	if err := os.WriteFile(hashPath, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(hashPath, []byte(content), 0o600); err != nil {
 		return digest, err
 	}
 	return digest, nil
@@ -233,7 +233,7 @@ tr:hover { background: #f5f5f5; }
 	}
 	b.WriteString("</body></html>")
 
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
 		return nil, "", err
 	}
 	digest, err := hashFile(path)

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
+	"runtime"
 	"strings"
 )
 
@@ -12,6 +14,17 @@ func loadEnv() {
 		return
 	}
 	defer f.Close()
+
+	// Check file permissions on Unix systems
+	if runtime.GOOS != "windows" {
+		info, err := f.Stat()
+		if err == nil {
+			mode := info.Mode().Perm()
+			if mode&0o077 != 0 {
+				fmt.Fprintf(os.Stderr, "Warning: .env file has permissions %o — should be 600 (owner-only). Fix with: chmod 600 .env\n", mode)
+			}
+		}
+	}
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {

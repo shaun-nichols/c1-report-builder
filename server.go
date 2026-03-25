@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -19,6 +22,11 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
+const (
+	sessionTimeout = 30 * time.Minute
+	maxRequestBody = 1 << 20 // 1MB
+)
+
 type server struct {
 	mu           sync.Mutex
 	client       *C1Client
@@ -26,8 +34,9 @@ type server struct {
 	templates    *TemplateStore
 	lastActivity time.Time
 	history      []reportHistoryEntry
-	// Cached full report data for the viewer
 	viewCache    *viewCacheEntry
+	sessionToken string // random token required on all authenticated requests
+	listenAddr   string // the actual address we're listening on
 }
 
 type viewCacheEntry struct {
@@ -46,13 +55,14 @@ type reportHistoryEntry struct {
 	Timestamp string   `json:"timestamp"`
 }
 
-const sessionTimeout = 30 * time.Minute
-
 type appJSON struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"displayName"`
 	UserCount   any    `json:"userCount"`
 }
+
+// Safe template ID pattern
+var safeIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 func startWebServer() {
 	initDataSources()
@@ -66,28 +76,32 @@ func startWebServer() {
 	webContent, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(webContent)))
 
+	// Public endpoints (no session required)
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, map[string]string{"version": Version})
 	})
+	mux.HandleFunc("/api/credentials", srv.handleCredentials)
 	mux.HandleFunc("/api/connect", srv.handleConnect)
+
+	// Session-protected endpoints
 	mux.HandleFunc("/api/datasources", srv.withSession(srv.handleDataSources))
 	mux.HandleFunc("/api/preview", srv.withSession(srv.handlePreview))
 	mux.HandleFunc("/api/view", srv.withSession(srv.handleView))
 	mux.HandleFunc("/api/generate", srv.withSession(srv.handleGenerate))
 	mux.HandleFunc("/api/templates/import", srv.withSession(srv.handleTemplateImport))
-	mux.HandleFunc("/api/templates", srv.handleTemplates) // list doesn't need session
-	mux.HandleFunc("/api/templates/", srv.handleTemplateByID)
-	mux.HandleFunc("/api/history", srv.handleHistory)
-	mux.HandleFunc("/api/cleanup", srv.handleCleanup)
-	mux.HandleFunc("/api/download/", srv.handleDownload)
+	mux.HandleFunc("/api/templates", srv.withSession(srv.handleTemplates))
+	mux.HandleFunc("/api/templates/", srv.withSession(srv.handleTemplateByID))
+	mux.HandleFunc("/api/history", srv.withSession(srv.handleHistory))
+	mux.HandleFunc("/api/cleanup", srv.withSession(srv.handleCleanup))
+	mux.HandleFunc("/api/download/", srv.withSession(srv.handleDownload))
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
 		os.Exit(1)
 	}
-	addr := listener.Addr().String()
-	url := "http://" + addr
+	srv.listenAddr = listener.Addr().String()
+	url := "http://" + srv.listenAddr
 
 	fmt.Printf("ConductorOne Report Builder\n")
 	fmt.Printf("Open your browser to: %s\n", url)
@@ -95,7 +109,10 @@ func startWebServer() {
 
 	openBrowser(url)
 
-	if err := http.Serve(listener, mux); err != nil {
+	// Wrap mux with security middleware
+	handler := srv.securityHeaders(srv.csrfProtection(mux))
+
+	if err := http.Serve(listener, handler); err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
 	}
@@ -114,10 +131,46 @@ func openBrowser(url string) {
 	cmd.Start()
 }
 
-// withSession checks session is active and refreshes the timeout.
+// --- Security middleware ---
+
+// securityHeaders adds standard security response headers.
+func (s *server) securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// csrfProtection validates Origin header on mutating requests.
+func (s *server) csrfProtection(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only check mutating methods on API endpoints
+		if strings.HasPrefix(r.URL.Path, "/api/") &&
+			(r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete) {
+
+			origin := r.Header.Get("Origin")
+			// Allow requests with no Origin (curl, non-browser clients)
+			if origin != "" {
+				allowed := "http://" + s.listenAddr
+				if origin != allowed {
+					jsonError(w, "Forbidden: invalid origin", http.StatusForbidden)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withSession checks session token and timeout.
 func (s *server) withSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
+		token := s.sessionToken
 		client := s.client
 		expired := !s.lastActivity.IsZero() && time.Since(s.lastActivity) > sessionTimeout
 		if client != nil && !expired {
@@ -125,11 +178,22 @@ func (s *server) withSession(next http.HandlerFunc) http.HandlerFunc {
 		}
 		s.mu.Unlock()
 
+		// Check session token
+		reqToken := r.Header.Get("X-Session-Token")
+		if token == "" || reqToken != token {
+			// Also check query param for download links (can't set headers on <a href>)
+			if r.URL.Query().Get("token") != token || token == "" {
+				jsonError(w, "Session expired — please reconnect", http.StatusUnauthorized)
+				return
+			}
+		}
+
 		if client == nil || expired {
 			if expired {
 				s.mu.Lock()
 				s.client = nil
 				s.apps = nil
+				s.sessionToken = ""
 				s.mu.Unlock()
 			}
 			jsonError(w, "Session expired — please reconnect", http.StatusUnauthorized)
@@ -139,14 +203,133 @@ func (s *server) withSession(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// GET /api/history
+// limitBody wraps a request body with a size limit.
+func limitBody(r *http.Request, w http.ResponseWriter) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+}
+
+// generateSessionToken creates a cryptographically random token.
+func generateSessionToken() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// --- Handlers ---
+
+func (s *server) handleCredentials(w http.ResponseWriter, r *http.Request) {
+	cs := newCredentialStore()
+
+	switch r.Method {
+	case http.MethodGet:
+		available := cs.isAvailable()
+		hasSaved := false
+		if available {
+			id, secret, _ := cs.load()
+			hasSaved = id != "" && secret != ""
+		}
+		jsonResp(w, map[string]any{
+			"keyringAvailable":    available,
+			"keyringName":         cs.platformName(),
+			"hasSavedCredentials": hasSaved,
+		})
+
+	case http.MethodDelete:
+		if err := cs.clear(); err != nil {
+			jsonError(w, "Failed to clear saved credentials", http.StatusInternalServerError)
+			return
+		}
+		jsonResp(w, map[string]string{"status": "cleared"})
+
+	default:
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limitBody(r, w)
+
+	var req struct {
+		ClientID      string `json:"clientId"`
+		ClientSecret  string `json:"clientSecret"`
+		SaveToKeyring bool   `json:"saveToKeyring"`
+		UseKeyring    bool   `json:"useKeyring"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	if req.UseKeyring {
+		cs := newCredentialStore()
+		id, secret, err := cs.load()
+		if err != nil || id == "" || secret == "" {
+			jsonError(w, "No saved credentials found", http.StatusBadRequest)
+			return
+		}
+		req.ClientID = id
+		req.ClientSecret = secret
+	}
+
+	if req.ClientID == "" || req.ClientSecret == "" {
+		jsonError(w, "Client ID and Client Secret are required", http.StatusBadRequest)
+		return
+	}
+
+	client, err := NewC1Client(req.ClientID, req.ClientSecret)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	appViews, err := client.ListApps()
+	if err != nil {
+		// Generic error — don't leak auth details
+		jsonError(w, "Authentication failed — check your Client ID and Client Secret", http.StatusUnauthorized)
+		return
+	}
+
+	if req.SaveToKeyring {
+		cs := newCredentialStore()
+		if err := cs.save(req.ClientID, req.ClientSecret); err != nil {
+			fmt.Printf("Warning: failed to save to keyring: %v\n", err)
+		}
+	}
+
+	apps := make([]appJSON, 0, len(appViews))
+	for _, av := range appViews {
+		app := av.App()
+		apps = append(apps, appJSON{ID: app.ID, DisplayName: app.DisplayName, UserCount: app.UserCount})
+	}
+
+	token := generateSessionToken()
+
+	s.mu.Lock()
+	s.client = client
+	s.apps = apps
+	s.lastActivity = time.Now()
+	s.history = nil
+	s.sessionToken = token
+	s.viewCache = nil
+	s.mu.Unlock()
+
+	jsonResp(w, map[string]any{"apps": apps, "sessionToken": token})
+}
+
+func (s *server) handleDataSources(w http.ResponseWriter, r *http.Request) {
+	jsonResp(w, allDataSources())
+}
+
 func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	jsonResp(w, s.history)
 }
 
-// POST /api/cleanup — delete output files older than 1 hour
 func (s *server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -172,79 +355,23 @@ func (s *server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, map[string]any{"deleted": deleted})
 }
 
-// POST /api/connect
-func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		ClientID     string `json:"clientId"`
-		ClientSecret string `json:"clientSecret"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "Invalid request", http.StatusBadRequest)
-		return
-	}
-
-	client, err := NewC1Client(req.ClientID, req.ClientSecret)
-	if err != nil {
-		jsonError(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	appViews, err := client.ListApps()
-	if err != nil {
-		jsonError(w, "Could not connect: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	apps := make([]appJSON, 0, len(appViews))
-	for _, av := range appViews {
-		app := av.App()
-		apps = append(apps, appJSON{ID: app.ID, DisplayName: app.DisplayName, UserCount: app.UserCount})
-	}
-
-	s.mu.Lock()
-	s.client = client
-	s.apps = apps
-	s.lastActivity = time.Now()
-	s.history = nil
-	s.mu.Unlock()
-
-	jsonResp(w, map[string]any{"apps": apps})
-}
-
-// GET /api/datasources
-func (s *server) handleDataSources(w http.ResponseWriter, r *http.Request) {
-	jsonResp(w, allDataSources())
-}
-
-// POST /api/preview
 func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	limitBody(r, w)
 
 	s.mu.Lock()
 	client := s.client
+	apps := s.apps
 	s.mu.Unlock()
-	if client == nil {
-		jsonError(w, "Not connected", http.StatusUnauthorized)
-		return
-	}
 
 	var req GenerateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-
-	s.mu.Lock()
-	apps := s.apps
-	s.mu.Unlock()
 
 	headers, rows, total, err := PreviewReport(client, req, apps)
 	if err != nil {
@@ -260,20 +387,13 @@ func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// POST /api/view — fetch full report data for browser viewing
-// Query params: page (1-based), pageSize (default 100), search (optional text filter)
-// First call with POST body loads data. Subsequent GET calls paginate the cached data.
 func (s *server) handleView(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
-		// Load full data
+		limitBody(r, w)
 		s.mu.Lock()
 		client := s.client
 		apps := s.apps
 		s.mu.Unlock()
-		if client == nil {
-			jsonError(w, "Not connected", http.StatusUnauthorized)
-			return
-		}
 
 		var req GenerateRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -287,16 +407,9 @@ func (s *server) handleView(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		setLoading := func(msg string) {
-			// server-side progress not visible to client, just log
-			fmt.Println("  " + msg)
-		}
-
-		// Fetch all data
 		appIDs := req.resolveAppIDs(apps)
 		var rows []map[string]string
 		if ds.RequiresApp && len(appIDs) > 0 {
-			setLoading("Fetching data from " + fmt.Sprintf("%d apps", len(appIDs)))
 			for _, aid := range appIDs {
 				r, err := ds.Fetch(client, aid, 0)
 				if err != nil {
@@ -305,11 +418,10 @@ func (s *server) handleView(w http.ResponseWriter, r *http.Request) {
 				rows = append(rows, r...)
 			}
 		} else {
-			setLoading("Fetching data...")
 			var err error
 			rows, err = ds.Fetch(client, "", 0)
 			if err != nil {
-				jsonError(w, "Fetch failed: "+err.Error(), http.StatusInternalServerError)
+				jsonError(w, "Fetch failed", http.StatusInternalServerError)
 				return
 			}
 		}
@@ -325,7 +437,6 @@ func (s *server) handleView(w http.ResponseWriter, r *http.Request) {
 		}
 		headers := columnLabels(ds, columns)
 
-		// Project to maps with header labels as keys
 		projected := make([]map[string]string, len(rows))
 		for i, row := range rows {
 			m := make(map[string]string, len(columns))
@@ -335,7 +446,6 @@ func (s *server) handleView(w http.ResponseWriter, r *http.Request) {
 			projected[i] = m
 		}
 
-		// Cache
 		s.mu.Lock()
 		s.viewCache = &viewCacheEntry{
 			Headers:  headers,
@@ -346,17 +456,15 @@ func (s *server) handleView(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}
 
-	// Return a page from the cache
 	s.mu.Lock()
 	cache := s.viewCache
 	s.mu.Unlock()
 
 	if cache == nil {
-		jsonError(w, "No report loaded. Submit a POST request first.", http.StatusBadRequest)
+		jsonError(w, "No report loaded", http.StatusBadRequest)
 		return
 	}
 
-	// Parse pagination params
 	q := r.URL.Query()
 	page := 1
 	pageSize := 100
@@ -376,7 +484,6 @@ func (s *server) handleView(w http.ResponseWriter, r *http.Request) {
 		pageSize = 500
 	}
 
-	// Search filter
 	search := strings.ToLower(q.Get("search"))
 	rows := cache.Rows
 	if search != "" {
@@ -407,11 +514,9 @@ func (s *server) handleView(w http.ResponseWriter, r *http.Request) {
 		end = total
 	}
 
-	pageRows := rows[start:end]
-
 	jsonResp(w, map[string]any{
 		"headers":    cache.Headers,
-		"rows":       pageRows,
+		"rows":       rows[start:end],
 		"total":      total,
 		"page":       page,
 		"pageSize":   pageSize,
@@ -420,20 +525,17 @@ func (s *server) handleView(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// POST /api/generate
 func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	limitBody(r, w)
 
 	s.mu.Lock()
 	client := s.client
+	apps := s.apps
 	s.mu.Unlock()
-	if client == nil {
-		jsonError(w, "Not connected", http.StatusUnauthorized)
-		return
-	}
 
 	var req GenerateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -447,18 +549,14 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		req.Name = "Custom Report"
 	}
 
-	s.mu.Lock()
-	apps := s.apps
-	s.mu.Unlock()
-
 	data, err := ExecuteReport(client, req, apps)
 	if err != nil {
-		jsonError(w, "Report failed: "+err.Error(), http.StatusInternalServerError)
+		jsonError(w, "Report generation failed", http.StatusInternalServerError)
 		return
 	}
 
-	if err := os.MkdirAll("output", 0o755); err != nil {
-		jsonError(w, "Error creating output dir", http.StatusInternalServerError)
+	if err := os.MkdirAll("output", 0o700); err != nil {
+		jsonError(w, "Could not create output directory", http.StatusInternalServerError)
 		return
 	}
 
@@ -470,11 +568,10 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 
 	files, digest, err := writeReport(data, "output", baseName, req.Format)
 	if err != nil {
-		jsonError(w, "Write failed: "+err.Error(), http.StatusInternalServerError)
+		jsonError(w, "Failed to write report", http.StatusInternalServerError)
 		return
 	}
 
-	// Record in history
 	s.mu.Lock()
 	s.history = append([]reportHistoryEntry{{
 		Name:      req.Name,
@@ -483,7 +580,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		Files:     files,
 		Hash:      digest,
 		Timestamp: data.Metadata["Generated At"],
-	}}, s.history...) // prepend (newest first)
+	}}, s.history...)
 	if len(s.history) > 50 {
 		s.history = s.history[:50]
 	}
@@ -496,20 +593,19 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GET /api/templates — list all
-// POST /api/templates — save new
 func (s *server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		jsonResp(w, s.templates.List())
 	case http.MethodPost:
+		limitBody(r, w)
 		var t ReportTemplate
 		if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
 			jsonError(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
 		if err := s.templates.Save(t); err != nil {
-			jsonError(w, err.Error(), http.StatusInternalServerError)
+			jsonError(w, "Failed to save template", http.StatusInternalServerError)
 			return
 		}
 		jsonResp(w, t)
@@ -518,15 +614,20 @@ func (s *server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// /api/templates/{id} — GET, PUT, DELETE
-// /api/templates/{id}/clone — POST
 func (s *server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/templates/")
 	parts := strings.SplitN(path, "/", 2)
 	id := parts[0]
 
+	// Validate template ID — prevent path traversal
+	if !safeIDPattern.MatchString(id) {
+		jsonError(w, "Invalid template ID", http.StatusBadRequest)
+		return
+	}
+
 	// Clone endpoint
 	if len(parts) == 2 && parts[1] == "clone" && r.Method == http.MethodPost {
+		limitBody(r, w)
 		var req struct {
 			Name string `json:"name"`
 		}
@@ -536,7 +637,7 @@ func (s *server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
 		}
 		clone, err := s.templates.Clone(id, req.Name)
 		if err != nil {
-			jsonError(w, err.Error(), http.StatusInternalServerError)
+			jsonError(w, "Failed to clone template", http.StatusInternalServerError)
 			return
 		}
 		jsonResp(w, clone)
@@ -553,6 +654,7 @@ func (s *server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, t)
 
 	case http.MethodPut:
+		limitBody(r, w)
 		var t ReportTemplate
 		if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
 			jsonError(w, "Invalid request", http.StatusBadRequest)
@@ -560,14 +662,14 @@ func (s *server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
 		}
 		t.ID = id
 		if err := s.templates.Save(t); err != nil {
-			jsonError(w, err.Error(), http.StatusInternalServerError)
+			jsonError(w, "Failed to save template", http.StatusInternalServerError)
 			return
 		}
 		jsonResp(w, t)
 
 	case http.MethodDelete:
 		if err := s.templates.Delete(id); err != nil {
-			jsonError(w, err.Error(), http.StatusBadRequest)
+			jsonError(w, "Cannot delete this template", http.StatusBadRequest)
 			return
 		}
 		jsonResp(w, map[string]string{"status": "deleted"})
@@ -577,21 +679,21 @@ func (s *server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// POST /api/templates/import — import a template from JSON
 func (s *server) handleTemplateImport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	limitBody(r, w)
 	var t ReportTemplate
 	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
 		jsonError(w, "Invalid template JSON", http.StatusBadRequest)
 		return
 	}
 	t.Builtin = false
-	t.ID = "" // generate new ID
+	t.ID = ""
 	if err := s.templates.Save(t); err != nil {
-		jsonError(w, err.Error(), http.StatusInternalServerError)
+		jsonError(w, "Failed to import template", http.StatusInternalServerError)
 		return
 	}
 	jsonResp(w, t)
@@ -599,7 +701,8 @@ func (s *server) handleTemplateImport(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/api/download/")
-	if name == "" || strings.Contains(name, "..") || strings.Contains(name, "/") {
+	// Strict filename validation
+	if name == "" || strings.ContainsAny(name, "../\\\"") || !sanitizedFilename(name) {
 		http.Error(w, "Invalid filename", http.StatusBadRequest)
 		return
 	}
@@ -608,20 +711,31 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeFilename(name)))
 	http.ServeFile(w, r, path)
+}
+
+// sanitizedFilename checks if a filename contains only safe characters.
+func sanitizedFilename(name string) bool {
+	for _, r := range name {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return len(name) > 0 && len(name) < 256
 }
 
 func sanitizeFilename(name string) string {
 	var b strings.Builder
 	for _, r := range name {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
 			b.WriteRune(r)
 		} else {
 			b.WriteRune('_')
 		}
 	}
-	return strings.Trim(b.String(), "_")
+	return strings.Trim(b.String(), "_.")
 }
 
 func jsonResp(w http.ResponseWriter, v any) {
