@@ -4,6 +4,22 @@ func builtinTemplates() []ReportTemplate {
 	return []ReportTemplate{
 		// === Data Audit ===
 		{
+			ID:          "app-accounts-entitlements-audit",
+			Name:        "App Accounts & Entitlements Audit",
+			Description: "One row per user with all entitlements consolidated — the original c1-report-tool report",
+			Category:    "Data Audit",
+			Builtin:     true,
+			DataSource:  "user_audit",
+			Columns: []string{
+				"displayName", "email", "username",
+				"identityUserId", "orphaned", "status", "appUserType",
+				"createdAt", "updatedAt",
+				"grantCount", "entitlements", "grantDetails",
+			},
+			SortBy: "displayName",
+			Format: "csv",
+		},
+		{
 			ID:          "all-users-entitlements",
 			Name:        "All Users & Entitlements",
 			Description: "Complete list of all account-entitlement grants for an app",

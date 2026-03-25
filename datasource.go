@@ -55,6 +55,7 @@ func initDataSources() {
 		"grant_feed":   grantFeedDataSource(),
 		"past_grants":  pastGrantsDataSource(),
 		"app_owners":   appOwnersDataSource(),
+		"user_audit":   userAuditDataSource(),
 	}
 }
 
