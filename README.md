@@ -1,5 +1,7 @@
 # ConductorOne Report Builder
 
+> **Disclaimer:** This is an independent, community-built tool. It is **not** an official ConductorOne product, not supported by ConductorOne, and not affiliated with or endorsed by ConductorOne, Inc. Use at your own risk. For official ConductorOne support, visit [conductorone.com](https://www.conductorone.com).
+
 Custom report builder for auditing ConductorOne data. Single binary with embedded web UI — no runtime dependencies.
 
 ## Install
