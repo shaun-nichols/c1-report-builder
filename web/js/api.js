@@ -1,21 +1,10 @@
 const API = {
   sessionToken: null,
 
-  async connect(clientId, clientSecret, saveToKeyring) {
-    const data = await this._post('/api/connect', { clientId, clientSecret, saveToKeyring: !!saveToKeyring });
+  async connect(clientId, clientSecret) {
+    const data = await this._post('/api/connect', { clientId, clientSecret });
     this.sessionToken = data.sessionToken || null;
     return data;
-  },
-  async connectFromKeyring() {
-    const data = await this._post('/api/connect', { useKeyring: true });
-    this.sessionToken = data.sessionToken || null;
-    return data;
-  },
-  async getCredentialStatus() {
-    return this._get('/api/credentials');
-  },
-  async clearCredentials() {
-    return this._fetch('/api/credentials', { method: 'DELETE' });
   },
   async getVersion() {
     return this._get('/api/version');

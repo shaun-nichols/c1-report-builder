@@ -21,21 +21,6 @@ const App = {
   },
 
   // --- Connect ---
-  async checkSavedCredentials() {
-    try {
-      const status = await API.getCredentialStatus();
-      if (status.keyringAvailable) {
-        document.getElementById('keyring-option').classList.remove('hidden');
-        document.getElementById('keyring-name-option').textContent = status.keyringName;
-        if (status.hasSavedCredentials) {
-          document.getElementById('keyring-connect').classList.remove('hidden');
-          document.getElementById('manual-connect').classList.add('hidden');
-          document.getElementById('keyring-name').textContent = status.keyringName;
-        }
-      }
-    } catch { /* keyring not available, show manual only */ }
-  },
-
   async connect() {
     const clientId = document.getElementById('clientId').value.trim();
     const clientSecret = document.getElementById('clientSecret').value.trim();
@@ -44,38 +29,12 @@ const App = {
       return;
     }
 
-    const saveToKeyring = document.getElementById('save-to-keyring')?.checked || false;
-
     showStatus('connect-status', 'Connecting...', 'info');
     try {
-      const data = await API.connect(clientId, clientSecret, saveToKeyring);
+      const data = await API.connect(clientId, clientSecret);
       this.onConnected(data);
     } catch (e) {
       showStatus('connect-status', e.message, 'error');
-    }
-  },
-
-  async connectFromKeyring() {
-    showStatus('connect-status', 'Connecting with saved credentials...', 'info');
-    try {
-      const data = await API.connectFromKeyring();
-      this.onConnected(data);
-    } catch (e) {
-      showStatus('connect-status', e.message, 'error');
-      // Show manual entry as fallback
-      document.getElementById('keyring-connect').classList.add('hidden');
-      document.getElementById('manual-connect').classList.remove('hidden');
-    }
-  },
-
-  async clearSavedCredentials() {
-    try {
-      await API.clearCredentials();
-      document.getElementById('keyring-connect').classList.add('hidden');
-      document.getElementById('manual-connect').classList.remove('hidden');
-      showStatus('connect-status', 'Saved credentials removed.', 'success');
-    } catch (e) {
-      showStatus('connect-status', 'Failed to clear: ' + e.message, 'error');
     }
   },
 
@@ -320,9 +279,7 @@ function setLoading(id, loading, msg) {
 }
 
 // --- Init ---
-document.addEventListener('DOMContentLoaded', () => {
-  App.checkSavedCredentials();
-});
+document.addEventListener('DOMContentLoaded', () => {});
 
 // --- Keyboard shortcuts ---
 document.addEventListener('keydown', (e) => {

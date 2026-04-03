@@ -80,7 +80,6 @@ func startWebServer() {
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, map[string]string{"version": Version})
 	})
-	mux.HandleFunc("/api/credentials", srv.handleCredentials)
 	mux.HandleFunc("/api/connect", srv.handleConnect)
 
 	// Session-protected endpoints
@@ -138,7 +137,7 @@ func (s *server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
@@ -217,35 +216,6 @@ func generateSessionToken() string {
 
 // --- Handlers ---
 
-func (s *server) handleCredentials(w http.ResponseWriter, r *http.Request) {
-	cs := newCredentialStore()
-
-	switch r.Method {
-	case http.MethodGet:
-		available := cs.isAvailable()
-		hasSaved := false
-		if available {
-			id, secret, _ := cs.load()
-			hasSaved = id != "" && secret != ""
-		}
-		jsonResp(w, map[string]any{
-			"keyringAvailable":    available,
-			"keyringName":         cs.platformName(),
-			"hasSavedCredentials": hasSaved,
-		})
-
-	case http.MethodDelete:
-		if err := cs.clear(); err != nil {
-			jsonError(w, "Failed to clear saved credentials", http.StatusInternalServerError)
-			return
-		}
-		jsonResp(w, map[string]string{"status": "cleared"})
-
-	default:
-		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
 func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -254,25 +224,12 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	limitBody(r, w)
 
 	var req struct {
-		ClientID      string `json:"clientId"`
-		ClientSecret  string `json:"clientSecret"`
-		SaveToKeyring bool   `json:"saveToKeyring"`
-		UseKeyring    bool   `json:"useKeyring"`
+		ClientID     string `json:"clientId"`
+		ClientSecret string `json:"clientSecret"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "Invalid request", http.StatusBadRequest)
 		return
-	}
-
-	if req.UseKeyring {
-		cs := newCredentialStore()
-		id, secret, err := cs.load()
-		if err != nil || id == "" || secret == "" {
-			jsonError(w, "No saved credentials found", http.StatusBadRequest)
-			return
-		}
-		req.ClientID = id
-		req.ClientSecret = secret
 	}
 
 	if req.ClientID == "" || req.ClientSecret == "" {
@@ -288,16 +245,8 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	appViews, err := client.ListApps()
 	if err != nil {
-		// Generic error — don't leak auth details
 		jsonError(w, "Authentication failed — check your Client ID and Client Secret", http.StatusUnauthorized)
 		return
-	}
-
-	if req.SaveToKeyring {
-		cs := newCredentialStore()
-		if err := cs.save(req.ClientID, req.ClientSecret); err != nil {
-			fmt.Printf("Warning: failed to save to keyring: %v\n", err)
-		}
 	}
 
 	apps := make([]appJSON, 0, len(appViews))
